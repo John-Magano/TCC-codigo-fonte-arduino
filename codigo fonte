@@ -1,0 +1,1463 @@
+// =======================
+// Dispensador HU - Interface com encoder, botoes e biometria
+// =======================
+
+#include <Adafruit_Fingerprint.h>
+#include <SoftwareSerial.h>
+#include <EEPROM.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <string.h>
+
+// --- CONFIGURAÇÕES GERAIS ---
+#define MAX_USERS    124
+#define LCD_COLUMNS  20
+#define LCD_ROWS     4
+
+// Estados principais do sistema
+#define STATE_MAIN       0   // Tela inicial
+#define STATE_ENTER      1   // Fluxo de identificação por digital
+#define STATE_ADMIN_AUTH 2   // (mantido só por referência)
+#define STATE_ADMIN_MENU 3   // Menu administrativo
+#define STATE_ENROLL     4   // Registro de usuário
+#define STATE_DELETE     5   // Exclusão de usuário
+#define STATE_LIST       6   // Lista de usuários
+#define STATE_USER_MENU  7   // Menu do usuário após liberar acesso
+#define STATE_WITHDRAW   8   // Estado de retirada de medicamento
+
+int programState = STATE_MAIN;
+
+// --- Estrutura de usuário na EEPROM ---
+struct User {
+  bool inUse;
+  char numericID[9];  // 8 dígitos + '\0'
+};
+
+// --- OBJETOS GERAIS ---
+#define fingerSerial Serial2
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+LiquidCrystal_I2C lcd(0x27, LCD_COLUMNS, LCD_ROWS);
+User userDatabase[MAX_USERS + 1];
+uint8_t id; // ID do sensor biométrico (1..MAX_USERS)
+
+// Índice genérico de menu
+int menuIndex = 0;
+
+// Controle de listagem
+int  listSelectedIndex = 0;
+int  listVisibleStart  = 0;
+bool isInitialList     = true;
+bool listCalledByAdmin = false;
+
+// --- SCANNER (MH-ETLiveScanner) ---
+SoftwareSerial mySerial(52, 53); // RX, TX
+
+const int BUF_SIZE = 64;
+char a[BUF_SIZE];
+int  k = 0;
+
+bool          trigger_sent           = false;
+unsigned long trigger_time          = 0;
+const unsigned long ACK_WINDOW_MS   = 500;
+const unsigned long READ_TIMEOUT_MS = 2000;
+const unsigned long RETRY_INTERVAL_MS = 600;
+
+char          lastCode[BUF_SIZE];
+unsigned long lastPrintTime          = 0;
+const unsigned long DUPLICATE_BLOCK_MS = 1000;
+unsigned long firstCharTime          = 0;
+
+enum StateType {
+  IDLE,
+  TRIGGERED
+};
+
+StateType stateMachine = IDLE;
+
+// --- SENHA ADMIN (string, tamanho dinâmico) ---
+const char ADMIN_PASSWORD[] = "012345";  // basta alterar aqui
+const int  ADMIN_MAX_LEN    = 10;
+
+// --- PINOS DOS BOTÕES ---
+const int BTN_CONFIRM_PIN = 22;  // botão verde -> confirmar
+const int BTN_BACK_PIN    = 24;  // botão vermelho -> voltar/cancelar
+
+// --- PINOS DE ATUAÇÃO (RETIRADA) ---
+const int SENSOR_FOTO_PIN   = 26; // entrada do sensor fotoelétrico (HIGH quando detecta)
+const int MOTOR_TAMBOR_PIN  = 28; // motor que libera a caixinha
+const int MOTOR_CORREIA_PIN = 30; // motor da correia
+
+// Tempos básicos de acionamento (ajustar depois nos testes)
+const unsigned long TEMPO_TAMBOR_MS        = 2000;
+const unsigned long TEMPO_CORREIA_MS       = 2000;
+const unsigned long TEMPO_APOS_TRIGGER_MS  = 2000;
+
+// Controle interno do fluxo de retirada
+byte          withdrawStep           = 0;
+unsigned long withdrawStepStart      = 0;
+bool          withdrawTriggeredScanner = false;
+unsigned long withdrawTriggerTime    = 0;
+bool          withdrawInitialized    = false;
+
+// ========================================================
+// PROTÓTIPOS
+// ========================================================
+void showMainMenu();
+void showAdminMenu();
+void showUserMenu();
+void showWithdrawIntro();
+void scannerStateMachine();
+void sendTrigger();
+void loadUsersFromEEPROM();
+void saveUserToEEPROM(uint8_t userID);
+void lcd_write_line(int row, const char* s);
+void listUsers_display(int validUserIDs[], int userCount, int selIndex, int visStart);
+int  findFirstEmptyID();
+uint8_t getFingerprintID(bool &found, bool verbose);
+uint8_t getFingerprintEnroll();
+void deleteFingerprint(uint8_t id_to_delete);
+void runEnrollment();
+void runDelete();
+void handleList();
+void handleWithdraw();
+void ensureSelectionVisible(int selIndex, int &visStart, int totalItems, int visibleLines, int direction);
+bool getNumericIDFromEncoder(char outID[9]);
+bool handleAdminAuth();
+char getConfirmCancelInput();
+
+// ========================================================
+// ENCODER – quadratura com filtro (sem interrupção)
+// ========================================================
+#define ENC_CLK 45
+#define ENC_DT  44
+
+const unsigned long DEBOUNCE_US = 2000UL;
+
+int8_t transition_table[16];
+int   enc_prevState;
+int   enc_currState;
+int   positionAccum = 0;
+unsigned long lastChangeUs = 0;
+
+volatile char encoderCommand = 0; // 'D' ou 'E'
+
+void setupTransitionTable() {
+  for (int i = 0; i < 16; ++i) transition_table[i] = 0;
+
+  // Horário
+  transition_table[(0<<2) | 1] = +1;
+  transition_table[(1<<2) | 3] = +1;
+  transition_table[(3<<2) | 2] = +1;
+  transition_table[(2<<2) | 0] = +1;
+
+  // Anti-horário
+  transition_table[(1<<2) | 0] = -1;
+  transition_table[(3<<2) | 1] = -1;
+  transition_table[(2<<2) | 3] = -1;
+  transition_table[(0<<2) | 2] = -1;
+}
+
+void checkEncoder() {
+  int aState = digitalRead(ENC_CLK);
+  int bState = digitalRead(ENC_DT);
+  enc_currState = (aState << 1) | bState;
+
+  if (enc_currState != enc_prevState) {
+    unsigned long now = micros();
+
+    if (now - lastChangeUs >= DEBOUNCE_US) {
+      int idx   = (enc_prevState << 2) | enc_currState;
+      int8_t delta = transition_table[idx];
+
+      if (delta != 0) {
+        positionAccum += delta;
+
+        // 4 micro-passos por clique
+        if (positionAccum >= 4) {
+          // horário -> subir/esquerda
+          encoderCommand = 'E';
+          positionAccum = 0;
+        } else if (positionAccum <= -4) {
+          // anti-horário -> descer/direita
+          encoderCommand = 'D';
+          positionAccum = 0;
+        }
+      }
+
+      lastChangeUs  = now;
+      enc_prevState = enc_currState;
+    } else {
+      enc_prevState = enc_currState;
+    }
+  }
+}
+
+char getEncoderCommand() {
+  char c = encoderCommand;
+  encoderCommand = 0;
+  return c;
+}
+
+// ========================================================
+// LEITURA DOS BOTÕES DE CONFIRMAR/VOLTAR
+// ========================================================
+char getConfirmCancelInput() {
+  static int lastConfirm = HIGH;
+  static int lastBack    = HIGH;
+  static unsigned long lastConfirmTime = 0;
+  static unsigned long lastBackTime    = 0;
+  const unsigned long BTN_DEBOUNCE_MS  = 20;
+
+  char result = 0;
+  unsigned long now = millis();
+
+  // Confirmar
+  int curConfirm = digitalRead(BTN_CONFIRM_PIN);
+  if (curConfirm != lastConfirm && (now - lastConfirmTime) > BTN_DEBOUNCE_MS) {
+    lastConfirmTime = now;
+    lastConfirm = curConfirm;
+    if (curConfirm == LOW) result = 'C'; // borda de descida
+  }
+
+  // Voltar
+  int curBack = digitalRead(BTN_BACK_PIN);
+  if (curBack != lastBack && (now - lastBackTime) > BTN_DEBOUNCE_MS) {
+    lastBackTime = now;
+    lastBack = curBack;
+    if (curBack == LOW && result == 0) result = 'E';
+  }
+
+  // Serial opcional (para debug)
+  if (result == 0 && Serial.available()) {
+    char c = toupper(Serial.read());
+    if (c == 'C') result = 'C';
+    else if (c == 'E') result = 'E';
+  }
+
+  return result;
+}
+
+// ========================================================
+// ENTRADA PARA MENUS (encoder + botões)
+// ========================================================
+char getMenuInput() {
+  // primeiro, giro do encoder
+  char e = getEncoderCommand();
+  if (e == 'D' || e == 'E') return e;
+
+  // depois, confirma/voltar
+  return getConfirmCancelInput();
+}
+
+// ========================================================
+// SETUP
+// ========================================================
+void setup() {
+  Serial.begin(9600);
+  while (!Serial) { }
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Inicializando...");
+
+  // Fingerprint
+  fingerSerial.begin(57600);
+  delay(100);
+
+  if (finger.verifyPassword()) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor encontrado!");
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sensor nao");
+    lcd.setCursor(0, 1);
+    lcd.print("encontrado!");
+    while (1) { delay(1); }
+  }
+  delay(1200);
+
+  // Encoder
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT,  INPUT_PULLUP);
+  setupTransitionTable();
+  {
+    int aState = digitalRead(ENC_CLK);
+    int bState = digitalRead(ENC_DT);
+    enc_prevState = (aState << 1) | bState;
+    enc_currState = enc_prevState;
+    lastChangeUs  = micros();
+    positionAccum = 0;
+    encoderCommand = 0;
+  }
+
+  // Botões físicos
+  pinMode(BTN_CONFIRM_PIN, INPUT_PULLUP);
+  pinMode(BTN_BACK_PIN,    INPUT_PULLUP);
+
+  // Atuadores da retirada
+  pinMode(MOTOR_TAMBOR_PIN,  OUTPUT);
+  pinMode(MOTOR_CORREIA_PIN, OUTPUT);
+  digitalWrite(MOTOR_TAMBOR_PIN,  LOW);
+  digitalWrite(MOTOR_CORREIA_PIN, LOW);
+
+  // Sensor fotoelétrico
+  pinMode(SENSOR_FOTO_PIN, INPUT);  // ajustar para INPUT_PULLUP se necessário
+
+  // Scanner
+  mySerial.begin(9600);
+  memset(a, 0, sizeof(a));
+  memset(lastCode, 0, sizeof(lastCode));
+  k             = 0;
+  stateMachine  = IDLE;
+  trigger_sent  = false;
+
+  // Usuários
+  loadUsersFromEEPROM();
+  showMainMenu();
+
+  Serial.println("Sistema pronto.");
+  Serial.println("---------------------------------");
+}
+
+// ========================================================
+// LOOP PRINCIPAL
+// ========================================================
+void loop() {
+
+  checkEncoder();
+
+  // Em STATE_LIST o handleList cuida das entradas
+  char cmd = 0;
+  if (programState != STATE_LIST && programState != STATE_WITHDRAW) {
+    cmd = getMenuInput();
+  }
+
+  // ----------------- Tela inicial -----------------
+  if (programState == STATE_MAIN) {
+
+    if      (cmd == 'D') { menuIndex++; if (menuIndex > 1) menuIndex = 0; showMainMenu(); }
+    else if (cmd == 'E') { menuIndex--; if (menuIndex < 0) menuIndex = 1; showMainMenu(); }
+    else if (cmd == 'C') {
+      if (menuIndex == 0) {
+        programState = STATE_ENTER;
+        lcd.clear();
+        lcd_write_line(0, "Identifique-se");
+        lcd_write_line(1, "Aproxime o dedo");
+        delay(500);
+      } else {
+        bool ok = handleAdminAuth();
+        if (ok) {
+          programState = STATE_ADMIN_MENU;
+          menuIndex = 0;
+          showAdminMenu();
+        } else {
+          programState = STATE_MAIN;
+          showMainMenu();
+        }
+      }
+    }
+  }
+
+  // ----------------- Identificação por digital -----------------
+  else if (programState == STATE_ENTER) {
+
+    if (cmd == 'E') {
+      programState = STATE_MAIN;
+      showMainMenu();
+    } else {
+      bool found = false;
+      uint8_t p = getFingerprintID(found, true);
+
+      if (found) {
+        programState = STATE_USER_MENU;
+        menuIndex = 0;
+        showUserMenu();
+        delay(200);
+      }
+      delay(80);
+    }
+  }
+
+  // ----------------- Menu Administrativo -----------------
+  else if (programState == STATE_ADMIN_MENU) {
+
+    if      (cmd == 'D') { menuIndex++; if (menuIndex > 3) menuIndex = 0; showAdminMenu(); }
+    else if (cmd == 'E') { menuIndex--; if (menuIndex < 0) menuIndex = 3; showAdminMenu(); }
+    else if (cmd == 'C') {
+
+      switch (menuIndex) {
+        case 0: // Registrar
+          programState = STATE_ENROLL;
+          runEnrollment();
+          programState = STATE_ADMIN_MENU;
+          menuIndex = 0;
+          showAdminMenu();
+          break;
+
+        case 1: // Lista
+          listCalledByAdmin = true;
+          isInitialList = true;
+          programState   = STATE_LIST;
+          break;
+
+        case 2: // Excluir
+          programState = STATE_DELETE;
+          runDelete();
+          programState = STATE_ADMIN_MENU;
+          menuIndex    = 0;
+          showAdminMenu();
+          break;
+
+        case 3: // Voltar
+          programState = STATE_MAIN;
+          showMainMenu();
+          break;
+      }
+    }
+  }
+
+  // ----------------- Menu do usuário -----------------
+  else if (programState == STATE_USER_MENU) {
+
+    if      (cmd == 'D') { menuIndex++; if (menuIndex > 2) menuIndex = 0; showUserMenu(); }
+    else if (cmd == 'E') { menuIndex--; if (menuIndex < 0) menuIndex = 2; showUserMenu(); }
+    else if (cmd == 'C') {
+
+      if (menuIndex == 0) {
+        // Retirada de medicamento
+        programState           = STATE_WITHDRAW;
+        withdrawStep           = 0;
+        withdrawInitialized    = false;
+        withdrawTriggeredScanner = false;
+      }
+      else if (menuIndex == 1) {
+        // Ver lista
+        listCalledByAdmin = false;
+        isInitialList     = true;
+        programState      = STATE_LIST;
+      }
+      else if (menuIndex == 2) {
+        // Voltar para tela inicial
+        programState = STATE_MAIN;
+        showMainMenu();
+      }
+    }
+  }
+
+  // ----------------- Lista de usuários -----------------
+  if (programState == STATE_LIST) {
+    handleList();
+  }
+
+  // ----------------- Fluxo de retirada -----------------
+  if (programState == STATE_WITHDRAW) {
+    handleWithdraw();
+  }
+
+  scannerStateMachine();
+  delay(5);
+}
+
+// ========================================================
+// LCD / Menus
+// ========================================================
+void lcd_write_line(int row, const char* s) {
+  char buf[21];
+  int len = snprintf(buf, sizeof(buf), "%s", s);
+  if (len < 0) len = 0;
+  while (len < 20) buf[len++] = ' ';
+  buf[20] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+void showMainMenu() {
+  lcd.clear();
+  lcd_write_line(0, "Identifique-se");
+  lcd_write_line(1, "para acessar o");
+  lcd_write_line(2, "dispensador");
+
+  char buf[21];
+  if (menuIndex == 0)
+    snprintf(buf, 21, "> Entrar    Admin");
+  else
+    snprintf(buf, 21, "  Entrar    >Admin");
+
+  lcd_write_line(3, buf);
+}
+
+void showAdminMenu() {
+  lcd.clear();
+  lcd_write_line(0, "AREA ADMINISTRATIVA");
+
+  if (menuIndex == 0) {
+    lcd_write_line(1, "> Registrar");
+    lcd_write_line(2, "  Lista Usuarios");
+    lcd_write_line(3, "  Excluir");
+  }
+  else if (menuIndex == 1) {
+    lcd_write_line(1, "  Registrar");
+    lcd_write_line(2, "> Lista Usuarios");
+    lcd_write_line(3, "  Excluir");
+  }
+  else if (menuIndex == 2) {
+    lcd_write_line(1, "  Registrar");
+    lcd_write_line(2, "  Lista Usuarios");
+    lcd_write_line(3, "> Excluir");
+  }
+  else {
+    lcd_write_line(1, "  Lista Usuarios");
+    lcd_write_line(2, "  Excluir");
+    lcd_write_line(3, "> Voltar");
+  }
+}
+
+void showUserMenu() {
+  lcd.clear();
+  lcd_write_line(0, "Acesso Liberado");
+
+  if (menuIndex == 0) {
+    lcd_write_line(1, "> Retirar Medic.");
+    lcd_write_line(2, "  Ver Lista");
+    lcd_write_line(3, "  Voltar");
+  }
+  else if (menuIndex == 1) {
+    lcd_write_line(1, "  Retirar Medic.");
+    lcd_write_line(2, "> Ver Lista");
+    lcd_write_line(3, "  Voltar");
+  }
+  else {
+    lcd_write_line(1, "  Retirar Medic.");
+    lcd_write_line(2, "  Ver Lista");
+    lcd_write_line(3, "> Voltar");
+  }
+}
+
+// Tela inicial da retirada
+void showWithdrawIntro() {
+  lcd.clear();
+  lcd_write_line(0, "Retirada de med.");
+  lcd_write_line(1, "Confirmar inicia");
+  lcd_write_line(2, "ciclo mecanico");
+  lcd_write_line(3, "Voltar cancela");
+}
+
+// ========================================================
+// LISTAGEM
+// ========================================================
+void listUsers_display(int validUserIDs[], int userCount, int selIndex, int visStart) {
+  int totalItems   = userCount + 1; // +Voltar
+  int visibleLines = 3;
+
+  lcd_write_line(0, "LISTA USUARIOS");
+
+  for (int line = 0; line < visibleLines; line++) {
+    int idx = visStart + line;
+    char out[21];
+
+    if (idx < userCount) {
+      int idToShow = validUserIDs[idx];
+      if (idx == selIndex)
+        snprintf(out, 21, ">%.8s", userDatabase[idToShow].numericID);
+      else
+        snprintf(out, 21, " %.8s", userDatabase[idToShow].numericID);
+    }
+    else if (idx == userCount) {
+      if (idx == selIndex) snprintf(out, 21, ">Voltar");
+      else                  snprintf(out, 21, " Voltar");
+    }
+    else {
+      snprintf(out, 21, " ");
+    }
+
+    lcd_write_line(line + 1, out);
+  }
+}
+
+void ensureSelectionVisible(int selIndex, int &visStart,
+                            int totalItems, int visibleLines, int direction)
+{
+  if (totalItems <= visibleLines) {
+    visStart = 0;
+    return;
+  }
+
+  if (direction > 0) {
+    int bottom = visibleLines - 1;
+    visStart = selIndex - bottom;
+    if (visStart < 0) visStart = 0;
+  }
+  else if (direction < 0) {
+    visStart = selIndex;
+    if (visStart < 0) visStart = 0;
+  }
+
+  if (visStart > totalItems - visibleLines)
+    visStart = totalItems - visibleLines;
+}
+
+void handleList() {
+
+  static int validUserIDs[MAX_USERS];
+  static int userCount = 0;
+
+  if (isInitialList) {
+    userCount = 0;
+    for (int i = 1; i <= MAX_USERS; i++) {
+      if (userDatabase[i].inUse) validUserIDs[userCount++] = i;
+    }
+    listSelectedIndex = 0;
+    listVisibleStart  = 0;
+    isInitialList     = false;
+    listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+  }
+
+  // Navegação com encoder
+  checkEncoder();
+  char ec = getEncoderCommand();
+  if (ec == 'D' || ec == 'E') {
+    int total = userCount + 1;
+
+    if (ec == 'D') {
+      listSelectedIndex++;
+      if (listSelectedIndex >= total) listSelectedIndex = 0;
+      ensureSelectionVisible(listSelectedIndex, listVisibleStart, total, 3, +1);
+    } else {
+      listSelectedIndex--;
+      if (listSelectedIndex < 0) listSelectedIndex = total - 1;
+      ensureSelectionVisible(listSelectedIndex, listVisibleStart, total, 3, -1);
+    }
+    listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+  }
+
+  // Confirmar / Voltar com botões
+  char c = getConfirmCancelInput();
+
+  if (c == 'E') {
+    // Botão de voltar sai direto da lista
+    if (listCalledByAdmin) {
+      programState = STATE_ADMIN_MENU;
+      menuIndex    = 0;
+      showAdminMenu();
+    } else {
+      programState = STATE_MAIN;
+      showMainMenu();
+    }
+    isInitialList = true;
+    return;
+  }
+
+  if (c == 'C') {
+    if (listSelectedIndex == userCount) {
+      // opção "Voltar"
+      if (listCalledByAdmin) {
+        programState = STATE_ADMIN_MENU;
+        menuIndex    = 0;
+        showAdminMenu();
+      } else {
+        programState = STATE_MAIN;
+        showMainMenu();
+      }
+      isInitialList = true;
+      return;
+    }
+
+    int selID = validUserIDs[listSelectedIndex];
+    lcd.clear();
+    lcd_write_line(0, userDatabase[selID].numericID);
+    lcd_write_line(2, "Confirma/voltar p/ sair");
+
+    unsigned long t0 = millis();
+    while (millis() - t0 < 1500) {
+      char q = getConfirmCancelInput();
+      if (q == 'C' || q == 'E') break;
+      delay(5);
+    }
+
+    listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+  }
+
+  scannerStateMachine();
+  delay(5);
+}
+
+// ========================================================
+// DELETE
+// ========================================================
+void runDelete() {
+
+  lcd.clear();
+  lcd_write_line(0, "MODO EXCLUSAO");
+
+  int userCount = 0;
+  int validUserIDs[MAX_USERS];
+
+  for (int i = 1; i <= MAX_USERS; i++) {
+    if (userDatabase[i].inUse) {
+      validUserIDs[userCount++] = i;
+    }
+  }
+
+  if (userCount == 0) {
+    lcd_write_line(1, "Nenhum usuario");
+    delay(1500);
+    return;
+  }
+
+  listSelectedIndex = 0;
+  listVisibleStart  = 0;
+  listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+
+  while (true) {
+    checkEncoder();
+    char ec = getEncoderCommand();
+    int total = userCount + 1;
+
+    if (ec == 'D') {
+      listSelectedIndex++;
+      if (listSelectedIndex >= total) listSelectedIndex = 0;
+      ensureSelectionVisible(listSelectedIndex, listVisibleStart, total, 3, +1);
+      listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+    }
+    else if (ec == 'E') {
+      listSelectedIndex--;
+      if (listSelectedIndex < 0) listSelectedIndex = total - 1;
+      ensureSelectionVisible(listSelectedIndex, listVisibleStart, total, 3, -1);
+      listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+    }
+
+    char c = getConfirmCancelInput();
+    if (c == 'E') {
+      // sair do modo exclusão
+      return;
+    }
+
+    if (c == 'C') {
+      if (listSelectedIndex == userCount) return;
+
+      int sel = validUserIDs[listSelectedIndex];
+
+      lcd.clear();
+      lcd_write_line(0, "Excluir?");
+      lcd_write_line(1, userDatabase[sel].numericID);
+      lcd_write_line(3, "Confirma=Sim  Voltar=Nao");
+
+      unsigned long t0   = millis();
+      bool decided       = false;
+      bool doDelete      = false;
+
+      while (!decided && (millis() - t0 < 15000)) {
+        char d = getConfirmCancelInput();
+        if (d == 'C') { doDelete = true; decided = true; }
+        if (d == 'E') { decided  = true; }
+        delay(5);
+      }
+
+      if (doDelete) {
+        deleteFingerprint(sel);
+
+        int newCount = 0;
+        for (int i = 0; i < userCount; i++) {
+          if (validUserIDs[i] != sel) validUserIDs[newCount++] = validUserIDs[i];
+        }
+        userCount = newCount;
+
+        if (userCount == 0) return;
+
+        listSelectedIndex = 0;
+        listVisibleStart  = 0;
+      }
+
+      listUsers_display(validUserIDs, userCount, listSelectedIndex, listVisibleStart);
+    }
+
+    scannerStateMachine();
+    delay(5);
+  }
+}
+
+// ========================================================
+// REGISTRO (ENROLLMENT)
+// ========================================================
+void runEnrollment() {
+
+  lcd.clear();
+  lcd_write_line(0, "REGISTRO USUARIO");
+
+  int newID = findFirstEmptyID();
+  if (newID <= 0) {
+    lcd_write_line(1, "Memoria cheia!");
+    delay(1200);
+    return;
+  }
+
+  id = (uint8_t)newID;
+
+  // Digital
+  if (!getFingerprintEnroll()) {
+    lcd.clear();
+    lcd_write_line(0, "Falha na digital");
+    delay(1200);
+    return;
+  }
+
+  lcd.clear();
+  lcd_write_line(0, "Digital OK");
+  lcd_write_line(1, "ID Sensor:");
+  lcd.setCursor(10, 1);
+  lcd.print(id);
+
+  lcd_write_line(2, "Definir numero (8d)");
+  delay(800);
+
+  // ID numérico
+  char newNumericID[9];
+  bool ok = getNumericIDFromEncoder(newNumericID);
+
+  if (!ok) {
+    lcd.clear();
+    lcd_write_line(0, "Cancelado");
+    finger.deleteModel(id);
+    userDatabase[id].inUse = false;
+    userDatabase[id].numericID[0] = '\0';
+    saveUserToEEPROM(id);
+    delay(1200);
+    return;
+  }
+
+  userDatabase[id].inUse = true;
+  strncpy(userDatabase[id].numericID, newNumericID, 9);
+  userDatabase[id].numericID[8] = '\0';
+
+  saveUserToEEPROM(id);
+
+  lcd.clear();
+  lcd_write_line(0, "Usuario salvo:");
+  lcd_write_line(1, userDatabase[id].numericID);
+  delay(1500);
+}
+
+// ========================================================
+// ID numérico pelo encoder (8 dígitos)
+// ========================================================
+const unsigned long PER_DIGIT_TIMEOUT_MS = 60000UL;
+const unsigned long CONFIRM_TIMEOUT_MS   = 60000UL;
+
+bool getNumericIDFromEncoder(char outID[9]) {
+
+  for (int i = 0; i < 8; i++) outID[i] = '0';
+  outID[8] = '\0';
+
+  for (int digitIndex = 0; digitIndex < 8; digitIndex++) {
+
+    int selectedDigit    = 0;
+    int lastShownDigit   = -1;
+    unsigned long lastActivity = millis();
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("0 1 2 3 4 5 6 7 8 9");
+
+    lcd.setCursor(0, 1);
+    lcd.print("^");
+
+    lcd.setCursor(0, 2);
+    lcd.print("Num: ");
+    for (int i = 0; i < 8; i++) {
+      if (i < digitIndex)           lcd.print(outID[i]);
+      else if (i == digitIndex)     lcd.print(selectedDigit);
+      else                          lcd.print("_");
+    }
+
+    lcd.setCursor(0, 3);
+    lcd.print("Confirma=OK Voltar=Cancelar");
+
+    while (true) {
+      if (millis() - lastActivity > PER_DIGIT_TIMEOUT_MS) {
+        return false;
+      }
+
+      checkEncoder();
+      char ec = getEncoderCommand();
+
+      if (ec == 'D') {
+        selectedDigit++;
+        if (selectedDigit > 9) selectedDigit = 0;
+        lastActivity = millis();
+      }
+      else if (ec == 'E') {
+        selectedDigit--;
+        if (selectedDigit < 0) selectedDigit = 9;
+        lastActivity = millis();
+      }
+
+      if (selectedDigit != lastShownDigit) {
+        lastShownDigit = selectedDigit;
+
+        lcd.setCursor(0, 1);
+        lcd.print("                    ");
+        lcd.setCursor(selectedDigit * 2, 1);
+        lcd.print("^");
+
+        lcd.setCursor(0, 2);
+        lcd.print("Num: ");
+        for (int i = 0; i < 8; i++) {
+          if (i < digitIndex)           lcd.print(outID[i]);
+          else if (i == digitIndex)     lcd.print(selectedDigit);
+          else                          lcd.print("_");
+        }
+      }
+
+      char c = getConfirmCancelInput();
+      if (c == 'C') {
+        outID[digitIndex] = '0' + selectedDigit;
+        lastActivity = millis();
+        break;
+      } else if (c == 'E') {
+        return false;
+      }
+
+      scannerStateMachine();
+      delay(5);
+    }
+  }
+
+  unsigned long startConfirm = millis();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ID completo:");
+  lcd.setCursor(0, 1);
+  lcd.print(outID);
+  lcd.setCursor(0, 3);
+  lcd.print("Confirma=Salvar Voltar=Refazer");
+
+  while (true) {
+    char c = getConfirmCancelInput();
+    if (c == 'C') return true;
+    if (c == 'E') return false;
+    if (c != 0)   startConfirm = millis();
+
+    if (millis() - startConfirm > CONFIRM_TIMEOUT_MS) {
+      return false;
+    }
+
+    scannerStateMachine();
+    delay(10);
+  }
+}
+
+// ========================================================
+// SENHA ADMIN COM ENCODER
+// ========================================================
+bool handleAdminAuth() {
+
+  int passLen = strlen(ADMIN_PASSWORD);
+  if (passLen <= 0) passLen = 1;
+  if (passLen > ADMIN_MAX_LEN) passLen = ADMIN_MAX_LEN;
+
+  char pinDigits[ADMIN_MAX_LEN + 1];
+  for (int i = 0; i < passLen; i++) pinDigits[i] = '0';
+  pinDigits[passLen] = '\0';
+
+  for (int digitIndex = 0; digitIndex < passLen; digitIndex++) {
+
+    int selectedDigit    = 0;
+    int lastShownDigit   = -1;
+    unsigned long lastActivity = millis();
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("0 1 2 3 4 5 6 7 8 9");
+
+    lcd.setCursor(0, 2);
+    lcd.print("PIN: ");
+    for (int i = 0; i < passLen; i++) {
+      if (i < digitIndex)          lcd.print(pinDigits[i]);
+      else if (i == digitIndex)    lcd.print(selectedDigit);
+      else                         lcd.print("_");
+    }
+
+    lcd.setCursor(0, 3);
+    lcd.print("Confirma=OK Voltar=Canc");
+
+    while (true) {
+      if (millis() - lastActivity > PER_DIGIT_TIMEOUT_MS) {
+        lcd.clear();
+        lcd_write_line(0, "Tempo esgotado");
+        delay(800);
+        return false;
+      }
+
+      checkEncoder();
+      char ec = getEncoderCommand();
+      if (ec == 'D') {
+        selectedDigit++;
+        if (selectedDigit > 9) selectedDigit = 0;
+        lastActivity = millis();
+      } else if (ec == 'E') {
+        selectedDigit--;
+        if (selectedDigit < 0) selectedDigit = 9;
+        lastActivity = millis();
+      }
+
+      if (selectedDigit != lastShownDigit) {
+        lastShownDigit = selectedDigit;
+
+        lcd.setCursor(0, 1);
+        lcd.print("                    ");
+        lcd.setCursor(selectedDigit * 2, 1);
+        lcd.print("^");
+
+        lcd.setCursor(0, 2);
+        lcd.print("PIN: ");
+        for (int i = 0; i < passLen; i++) {
+          if (i < digitIndex)          lcd.print(pinDigits[i]);
+          else if (i == digitIndex)    lcd.print(selectedDigit);
+          else                         lcd.print("_");
+        }
+      }
+
+      char c = getConfirmCancelInput();
+      if (c == 'C') {
+        pinDigits[digitIndex] = '0' + selectedDigit;
+        lastActivity = millis();
+        break;
+      }
+      if (c == 'E') {
+        return false;
+      }
+
+      scannerStateMachine();
+      delay(5);
+    }
+  }
+
+  char enteredPIN[ADMIN_MAX_LEN + 1];
+  for (int i = 0; i < passLen; i++) enteredPIN[i] = pinDigits[i];
+  enteredPIN[passLen] = '\0';
+
+  unsigned long startConfirm = millis();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Senha digitada:");
+  lcd.setCursor(0, 1);
+  lcd.print(enteredPIN);
+  lcd.setCursor(0, 3);
+  lcd.print("Confirma=Entrar Voltar");
+
+  while (true) {
+    char c = getConfirmCancelInput();
+    if (c == 'C') {
+      if (strcmp(enteredPIN, ADMIN_PASSWORD) == 0) {
+        lcd.clear();
+        lcd_write_line(0, "Acesso Admin OK");
+        delay(800);
+        return true;
+      } else {
+        lcd.clear();
+        lcd_write_line(0, "Senha incorreta");
+        delay(1000);
+        return false;
+      }
+    }
+    if (c == 'E') {
+      return false;
+    }
+    if (c != 0) startConfirm = millis();
+
+    if (millis() - startConfirm > CONFIRM_TIMEOUT_MS) {
+      lcd.clear();
+      lcd_write_line(0, "Tempo esgotado");
+      delay(800);
+      return false;
+    }
+
+    scannerStateMachine();
+    delay(10);
+  }
+}
+
+// ========================================================
+// FLUXO DE RETIRADA
+// ========================================================
+void handleWithdraw() {
+
+  // Inicialização da tela de retirada
+  if (!withdrawInitialized) {
+    withdrawStep            = 0;
+    withdrawTriggeredScanner = false;
+    showWithdrawIntro();
+    withdrawInitialized     = true;
+  }
+
+  char btn = getConfirmCancelInput();
+
+  // Botão de voltar sempre aborta a retirada
+  if (btn == 'E') {
+    digitalWrite(MOTOR_TAMBOR_PIN,  LOW);
+    digitalWrite(MOTOR_CORREIA_PIN, LOW);
+    programState        = STATE_USER_MENU;
+    menuIndex           = 0;
+    withdrawInitialized = false;
+    showUserMenu();
+    return;
+  }
+
+  unsigned long now = millis();
+
+  switch (withdrawStep) {
+
+    case 0:
+      // Esperando confirmação para iniciar ciclo
+      if (btn == 'C') {
+        digitalWrite(MOTOR_TAMBOR_PIN, HIGH);
+        withdrawStep      = 1;
+        withdrawStepStart = now;
+        lcd.clear();
+        lcd_write_line(0, "Girando tambor");
+        lcd_write_line(1, "Liberando caixa");
+      }
+      break;
+
+    case 1:
+      // Motor do tambor ligado por tempo definido
+      if (now - withdrawStepStart >= TEMPO_TAMBOR_MS) {
+        digitalWrite(MOTOR_TAMBOR_PIN, LOW);
+        digitalWrite(MOTOR_CORREIA_PIN, HIGH);
+        withdrawStep      = 2;
+        withdrawStepStart = now;
+        lcd.clear();
+        lcd_write_line(0, "Movendo correia");
+        lcd_write_line(1, "Levando remedio");
+      }
+      break;
+
+    case 2:
+      // Correia ligada
+      if (now - withdrawStepStart >= TEMPO_CORREIA_MS) {
+        digitalWrite(MOTOR_CORREIA_PIN, LOW);
+        withdrawStep = 3;
+        lcd.clear();
+        lcd_write_line(0, "Aguardando no");
+        lcd_write_line(1, "sensor fotoel.");
+      }
+      break;
+
+    case 3: {
+      // Espera o sensor fotoelétrico detectar a caixinha
+      int sensorState = digitalRead(SENSOR_FOTO_PIN);
+
+      if (sensorState == HIGH && !withdrawTriggeredScanner) {
+        sendTrigger();
+        withdrawTriggeredScanner = true;
+        withdrawTriggerTime = now;
+        lcd.clear();
+        lcd_write_line(0, "Lendo codigo...");
+      }
+
+      if (withdrawTriggeredScanner &&
+          (now - withdrawTriggerTime >= TEMPO_APOS_TRIGGER_MS)) {
+        withdrawStep = 4;
+        lcd.clear();
+        lcd_write_line(0, "Retirada concluida");
+        lcd_write_line(1, "Confirma ou voltar");
+      }
+      break;
+    }
+
+    case 4:
+      // Fim do ciclo: qualquer botão leva de volta ao menu do usuário
+      if (btn == 'C') {
+        programState        = STATE_USER_MENU;
+        menuIndex           = 0;
+        withdrawInitialized = false;
+        showUserMenu();
+        return;
+      }
+      break;
+  }
+
+  // scannerStateMachine() já é chamado no loop principal
+}
+
+// ========================================================
+// SCANNER
+// ========================================================
+void sendTrigger() {
+  mySerial.print("~T.");
+  trigger_sent  = true;
+  trigger_time  = millis();
+  stateMachine  = TRIGGERED;
+  memset(a, 0, sizeof(a));
+  k            = 0;
+  firstCharTime = 0;
+}
+
+void scannerStateMachine() {
+
+  if (stateMachine == TRIGGERED) {
+    if ((millis() - trigger_time) >= READ_TIMEOUT_MS) {
+      sendTrigger();
+      delay(20);
+    } else if (k == 0 && (millis() - trigger_time) >= RETRY_INTERVAL_MS) {
+      sendTrigger();
+      delay(20);
+    }
+  }
+
+  while (mySerial.available()) {
+    char c = (char)mySerial.read();
+
+    if (k == 0) firstCharTime = millis();
+
+    if (c == '\r' || c == '\n') {
+      if (k > 0) {
+        a[k] = '\0';
+
+        if (trigger_sent && (firstCharTime - trigger_time) <= ACK_WINDOW_MS) {
+          int startIdx = 0;
+          while (startIdx < k && a[startIdx] == 'T') startIdx++;
+          if (startIdx > 0) {
+            int newLen = 0;
+            for (int i = startIdx; i < k; i++) a[newLen++] = a[i];
+            a[newLen] = '\0';
+            k = newLen;
+          }
+        }
+
+        if (k > 0) {
+          bool isDuplicate =
+            (strcmp(a, lastCode) == 0) &&
+            ((millis() - lastPrintTime) < DUPLICATE_BLOCK_MS);
+
+          if (!isDuplicate) {
+            Serial.print("Codigo lido: ");
+            Serial.println(a);
+            strncpy(lastCode, a, BUF_SIZE - 1);
+            lastCode[BUF_SIZE - 1] = '\0';
+            lastPrintTime = millis();
+          }
+
+          stateMachine = IDLE;
+          trigger_sent = false;
+        } else {
+          stateMachine = TRIGGERED;
+        }
+
+        memset(a, 0, sizeof(a));
+        k = 0;
+      }
+      continue;
+    }
+
+    if (c >= 32 && c <= 126) {
+      if (k < (BUF_SIZE - 1)) {
+        a[k++] = c;
+      } else {
+        memset(a, 0, sizeof(a));
+        k = 0;
+      }
+    }
+  }
+}
+
+// ========================================================
+// BIOMETRIA
+// ========================================================
+void deleteFingerprint(uint8_t id_to_delete) {
+  uint8_t p = finger.deleteModel(id_to_delete);
+  if (p == FINGERPRINT_OK) {
+    lcd.setCursor(0, 3);
+    lcd.print("Excluido com sucesso!");
+    userDatabase[id_to_delete].inUse = false;
+    userDatabase[id_to_delete].numericID[0] = '\0';
+    saveUserToEEPROM(id_to_delete);
+  } else {
+    lcd.setCursor(0, 3);
+    lcd.print("Falha ao excluir.");
+  }
+}
+
+int findFirstEmptyID() {
+  for (int page = 1; page <= MAX_USERS; page++) {
+    if (!userDatabase[page].inUse) return page;
+  }
+  return 0;
+}
+
+uint8_t getFingerprintEnroll() {
+  int p = -1;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Coloque o dedo...");
+
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      lcd.setCursor(0, 1);
+      lcd.print("Imagem capturada");
+    } else if (p != FINGERPRINT_NOFINGER) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Erro imagem");
+      return false;
+    }
+    scannerStateMachine();
+    delay(5);
+  }
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Erro conversao 1");
+    return false;
+  }
+
+  lcd.setCursor(0, 2);
+  lcd.print("Retire o dedo");
+  delay(1000);
+  while (finger.getImage() != FINGERPRINT_NOFINGER) {
+    scannerStateMachine();
+    delay(5);
+  }
+
+  lcd.setCursor(0, 3);
+  lcd.print("Coloque de novo");
+  p = -1;
+  while (p != FINGERPRINT_OK) {
+    p = finger.getImage();
+    if (p == FINGERPRINT_OK) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("2a imagem OK");
+    } else if (p != FINGERPRINT_NOFINGER) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Erro imagem 2");
+      return false;
+    }
+    scannerStateMachine();
+    delay(5);
+  }
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Erro conversao 2");
+    return false;
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print("Criando modelo");
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    lcd.setCursor(0, 1);
+    lcd.print("Modelos dif.");
+    return false;
+  }
+
+  lcd.setCursor(0, 2);
+  lcd.print("Salvando...");
+  p = finger.storeModel(id);
+  if (p != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Erro salvar");
+    return false;
+  }
+
+  return true;
+}
+
+uint8_t getFingerprintID(bool &found, bool verbose) {
+  found = false;
+  uint8_t p = finger.getImage();
+  if (p != FINGERPRINT_OK) return p;
+
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) return p;
+
+  p = finger.fingerSearch();
+  if (p == FINGERPRINT_OK) {
+
+    uint8_t foundID = finger.fingerID;
+
+    if (foundID <= MAX_USERS && userDatabase[foundID].inUse) {
+      found = true;
+      if (verbose) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Acesso Liberado!");
+        lcd.setCursor(0, 1);
+        lcd.print("Usuario:");
+        lcd.setCursor(0, 2);
+        lcd.print(userDatabase[foundID].numericID);
+        delay(1500);
+      }
+      return p;
+    } else {
+      if (verbose) {
+        lcd.clear();
+        lcd_write_line(0, "Acesso negado");
+        lcd_write_line(1, "Usuario nao cad.");
+        delay(1200);
+      }
+      return FINGERPRINT_NOTFOUND;
+    }
+  }
+  else if (p == FINGERPRINT_NOTFOUND) {
+    if (verbose) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Acesso Negado");
+      lcd.setCursor(0, 1);
+      lcd.print("Digital nao");
+      lcd.setCursor(0, 2);
+      lcd.print("reconhecida");
+      delay(1000);
+    }
+    return p;
+  }
+  else {
+    if (verbose) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Erro no sensor");
+      delay(1000);
+    }
+    return p;
+  }
+}
+
+// ========================================================
+// EEPROM
+// ========================================================
+void loadUsersFromEEPROM() {
+  for (int i = 1; i <= MAX_USERS; i++) {
+    int address = i * sizeof(User);
+    EEPROM.get(address, userDatabase[i]);
+
+    char c0 = userDatabase[i].numericID[0];
+
+    if (c0 >= '0' && c0 <= '9') {
+      userDatabase[i].inUse = true;
+      userDatabase[i].numericID[8] = '\0';
+    } else {
+      userDatabase[i].inUse = false;
+      userDatabase[i].numericID[0] = '\0';
+    }
+  }
+}
+
+void saveUserToEEPROM(uint8_t userID) {
+  int address = userID * sizeof(User);
+  EEPROM.put(address, userDatabase[userID]);
+}
