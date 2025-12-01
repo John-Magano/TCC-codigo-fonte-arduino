@@ -87,7 +87,9 @@ Toda a interface é feita em um LCD 20x4 I2C com um encoder rotativo para navega
 | Encoder CLK           | 45           | `INPUT_PULLUP`                         |
 | Encoder DT            | 44           | `INPUT_PULLUP`                         |
 | Botão Confirmar       | 22           | `INPUT_PULLUP`, ativo em nível LOW     |
-| Botão Voltar/Cancelar | 24           | `INPUT_PULLUP`, ativo em nível LOW     |
+| Botão Medicamento 1   | 23           | `INPUT_PULLUP`, ativo em nível LOW     |
+| Botão Medicamento 2   | 24           | `INPUT_PULLUP`, ativo em nível LOW     |
+| Botão Voltar/Cancelar | 25           | `INPUT_PULLUP`, ativo em nível LOW     |
 | LCD I2C SDA           | SDA (20)     | Barramento I2C                         |
 | LCD I2C SCL           | SCL (21)     | Barramento I2C                         |
 
